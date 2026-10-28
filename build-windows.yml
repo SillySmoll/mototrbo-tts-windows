@@ -1,0 +1,71 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed only to attach the .exe to a Release on v* tags
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build MotoTRBO-TTS.exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name MotoTRBO-TTS --icon icon.ico --add-data "icon.ico;."
+          --collect-all piper --collect-binaries onnxruntime
+          app.py
+
+      - name: Self-test the exe (real Piper voice, checks WAV format)
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "selftest"
+          $p = Start-Process -FilePath dist\MotoTRBO-TTS.exe -ArgumentList "--selftest", "`"$out`"" -Wait -PassThru
+          Get-Content "$out\selftest.log"
+          if ($p.ExitCode -ne 0) { throw "Self-test failed with exit code $($p.ExitCode)" }
+          New-Item -ItemType Directory -Force sample-output | Out-Null
+          Copy-Item "$out\*.wav" sample-output
+
+      - name: GUI smoke test (opens the window, exercises it, closes)
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "gui.log"
+          $p = Start-Process -FilePath dist\MotoTRBO-TTS.exe -ArgumentList "--gui-smoketest", "`"$log`"" -Wait -PassThru
+          Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "GUI smoke test failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotoTRBO-TTS-windows
+          path: |
+            dist/MotoTRBO-TTS.exe
+            phrases.lst
+            README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sample-wav-output
+          path: sample-output/*.wav
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/MotoTRBO-TTS.exe
