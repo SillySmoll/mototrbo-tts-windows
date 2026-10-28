@@ -1,0 +1,59 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build MotoTRBO-TTS.exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name MotoTRBO-TTS --icon icon.ico --add-data "icon.ico;."
+          --collect-all piper --collect-binaries onnxruntime
+          app.py
+
+      - name: Self-test the exe
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "selftest"
+          $p = Start-Process -FilePath dist\MotoTRBO-TTS.exe -ArgumentList "--selftest", "`"$out`"" -Wait -PassThru
+          Get-Content "$out\selftest.log"
+          if ($p.ExitCode -ne 0) { throw "Self-test failed" }
+
+      - name: GUI smoke test
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "gui.log"
+          $p = Start-Process -FilePath dist\MotoTRBO-TTS.exe -ArgumentList "--gui-smoketest", "`"$log`"" -Wait -PassThru
+          Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "GUI smoke test failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotoTRBO-TTS-windows
+          path: dist/MotoTRBO-TTS.exe
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/MotoTRBO-TTS.exe
