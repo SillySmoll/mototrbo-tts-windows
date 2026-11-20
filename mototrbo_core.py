@@ -58,9 +58,20 @@ def app_data_dir() -> Path:
 
 
 def voices_dir() -> Path:
+    """Per-user folder for voices downloaded on demand."""
     p = app_data_dir() / "voices"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def bundled_voices_dir() -> Path:
+    """Read-only voices shipped by the installer, in a 'voices' folder next to the exe."""
+    override = os.environ.get("MOTOTRBO_BUNDLED_VOICES")
+    if override:
+        return Path(override)
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "voices"
+    return Path(__file__).resolve().parent / "voices"
 
 
 def default_output_dir() -> Path:
@@ -198,29 +209,45 @@ def _parse_catalog(data: dict) -> list[VoiceInfo]:
 def load_voice_catalog(refresh: bool = False) -> list[VoiceInfo]:
     """Voice list from Hugging Face, cached locally so the app works offline."""
     cache = app_data_dir() / "voices.json"
+    bundled = bundled_voices_dir() / "voices.json"
     if refresh or not cache.exists():
         try:
-            raw = _http_get(VOICES_JSON_URL)
+            raw = _http_get(VOICES_JSON_URL, timeout=10)
             json.loads(raw)  # validate before caching
             cache.write_bytes(raw)
         except Exception:
-            if not cache.exists():
+            if not cache.exists() and not bundled.exists():
                 raise
-    return _parse_catalog(json.loads(cache.read_text(encoding="utf-8")))
+    src = cache if cache.exists() else bundled
+    return _parse_catalog(json.loads(src.read_text(encoding="utf-8")))
+
+
+def _has_model(folder: Path, key: str) -> bool:
+    p = folder / f"{key}.onnx"
+    return p.exists() and Path(str(p) + ".json").exists()
+
+
+def is_voice_bundled(key: str) -> bool:
+    return _has_model(bundled_voices_dir(), key)
 
 
 def local_model_path(key: str) -> Path:
+    """Built-in copy if the installer shipped it, else the per-user download location."""
+    if is_voice_bundled(key):
+        return bundled_voices_dir() / f"{key}.onnx"
     return voices_dir() / f"{key}.onnx"
 
 
 def is_voice_installed(key: str) -> bool:
-    p = local_model_path(key)
-    return p.exists() and Path(str(p) + ".json").exists()
+    return is_voice_bundled(key) or _has_model(voices_dir(), key)
 
 
 def installed_voices() -> list[str]:
-    return sorted(p.stem for p in voices_dir().glob("*.onnx")
-                  if Path(str(p) + ".json").exists())
+    keys = set()
+    for folder in (bundled_voices_dir(), voices_dir()):
+        if folder.is_dir():
+            keys |= {p.stem for p in folder.glob("*.onnx") if Path(str(p) + ".json").exists()}
+    return sorted(keys)
 
 
 def download_voice(voice: VoiceInfo | str,
@@ -228,7 +255,9 @@ def download_voice(voice: VoiceInfo | str,
     """Download <key>.onnx and <key>.onnx.json into the voices folder."""
     if isinstance(voice, str):
         voice = VoiceInfo(voice, "", voice, "", _guess_onnx_path(voice))
-    dest = local_model_path(voice.key)
+    if is_voice_bundled(voice.key):
+        return local_model_path(voice.key)
+    dest = voices_dir() / f"{voice.key}.onnx"
     for suffix in (".onnx.json", ".onnx"):
         target = Path(str(dest)[: -len(".onnx")] + suffix)
         if target.exists() and target.stat().st_size > 0:

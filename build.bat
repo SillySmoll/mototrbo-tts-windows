@@ -1,6 +1,7 @@
 @echo off
-REM Build MotoTRBO-TTS.exe on Windows.
-REM Needs Python 3.10-3.13 (64-bit) from python.org, with "Add to PATH" ticked.
+REM Build the MotoTRBO TTS installer on Windows, with all English voices built in.
+REM Needs: 64-bit Python 3.10-3.13 from python.org ("Add to PATH" ticked),
+REM        Inno Setup 6 (https://jrsoftware.org/isdl.php), about 15 GB free disk.
 setlocal
 cd /d "%~dp0"
 
@@ -12,19 +13,33 @@ call .build-venv\Scripts\activate.bat || goto :fail
 python -m pip install --upgrade pip || goto :fail
 python -m pip install -r requirements.txt pyinstaller || goto :fail
 
-echo === Building MotoTRBO-TTS.exe ===
-pyinstaller --noconfirm --clean --onefile --windowed ^
+echo === Building app folder ===
+pyinstaller --noconfirm --clean --onedir --windowed ^
   --name MotoTRBO-TTS --icon icon.ico --add-data "icon.ico;." ^
   --collect-all piper --collect-binaries onnxruntime ^
   app.py || goto :fail
 
-echo === Self-test (downloads one small voice) ===
-start /wait "" dist\MotoTRBO-TTS.exe --selftest "%CD%\selftest-output"
+echo === Downloading English voices (several GB; safe to re-run) ===
+python fetch_voices.py --match "^en_" --out voices || goto :fail
+
+echo === Self-test ===
+set MOTOTRBO_BUNDLED_VOICES=%CD%\voices
+start /wait "" dist\MotoTRBO-TTS\MotoTRBO-TTS.exe --selftest "%CD%\selftest-output"
 type selftest-output\selftest.log
 findstr /c:"SELFTEST PASSED" selftest-output\selftest.log >nul || goto :fail
+set MOTOTRBO_BUNDLED_VOICES=
+
+echo === Building installer ===
+set ISCC="%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+if not exist %ISCC% (
+  echo Inno Setup 6 not found. Install it from https://jrsoftware.org/isdl.php and run build.bat again.
+  goto :fail
+)
+%ISCC% /Q installer.iss || goto :fail
 
 echo.
-echo Done:  %CD%\dist\MotoTRBO-TTS.exe
+echo Done. Installer files are in %CD%\installer-output
+echo Keep MotoTRBO-TTS-Setup.exe and all MotoTRBO-TTS-Setup-*.bin files together.
 exit /b 0
 
 :fail

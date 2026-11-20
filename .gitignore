@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+.build-venv/
+*.spec
+selftest-output/
+output/
+voices/
+installer-output/

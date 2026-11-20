@@ -10,6 +10,7 @@ Selftest: MotoTRBO-TTS.exe --selftest C:\\some\\folder     (used by the Windows 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
 import shutil
@@ -29,7 +30,7 @@ if sys.stderr is None:
 import mototrbo_core as core
 
 APP_TITLE = "MotoTRBO TTS - Voice Announcement Builder"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 IS_WINDOWS = sys.platform == "win32"
 
 
@@ -92,6 +93,29 @@ def run_headless(args) -> int:
     return rc
 
 
+def check_bundled_voices(log_file: str) -> int:
+    """Build check: load every built-in voice and synthesize a short phrase with it."""
+    folder = core.bundled_voices_dir()
+    keys = sorted(p.stem for p in folder.glob("*.onnx")) if folder.is_dir() else []
+    lines, bad = [f"Built-in voices folder: {folder}", f"Found {len(keys)} voice(s)"], 0
+    for k in keys:
+        try:
+            spk = 0 if json.loads(Path(folder / f"{k}.onnx.json").read_text(encoding="utf-8")
+                                  ).get("num_speakers", 1) > 1 else None
+            y = core.render_phrase("Zone one", folder / f"{k}.onnx", speaker_id=spk)
+            ok = len(y) > 1000
+            lines.append(f"{'OK  ' if ok else 'FAIL'} {k}  ({len(y) / core.TARGET_RATE:.1f} s)")
+            bad += 0 if ok else 1
+        except Exception as e:
+            lines.append(f"FAIL {k}: {e}")
+            bad += 1
+    if not keys:
+        bad = 1
+    lines.append("VOICE CHECK PASSED" if bad == 0 else f"VOICE CHECK FAILED ({bad} problem(s))")
+    Path(log_file).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return 1 if bad else 0
+
+
 # ==========================================================================
 # GUI
 # ==========================================================================
@@ -138,6 +162,7 @@ def run_gui(smoke_log: str | None = None) -> int:
             self.out_var = tk.StringVar(value=self.settings.get("output_dir", str(core.default_output_dir())))
             self.cps_var = tk.StringVar(value=self.settings.get("cps_dir", core.DEFAULT_CPS_DIR))
             self.copy_after_var = tk.BooleanVar(value=bool(self.settings.get("copy_after", False)))
+            self.all_langs_var = tk.BooleanVar(value=bool(self.settings.get("all_languages", False)))
 
             self._build()
             self._load_phrases()
@@ -171,6 +196,8 @@ def run_gui(smoke_log: str | None = None) -> int:
             self.voice_cb.grid(row=0, column=3, sticky="ew", **pad)
             self.voice_cb.bind("<<ComboboxSelected>>", lambda e: self._on_voice())
             ttk.Button(vf, text="Refresh list", command=lambda: self._load_catalog(True)).grid(row=0, column=4, **pad)
+            ttk.Checkbutton(vf, text="Show other languages", variable=self.all_langs_var,
+                            command=self._refresh_langs).grid(row=1, column=4, sticky="w", padx=8)
 
             ttk.Label(vf, textvariable=self.voice_status, style="Hint.TLabel").grid(
                 row=1, column=1, columnspan=3, sticky="w", padx=8)
@@ -344,13 +371,27 @@ def run_gui(smoke_log: str | None = None) -> int:
                 self.by_lang = {}
                 for v in cat:
                     self.by_lang.setdefault(v.language, []).append(v)
-                self.lang_cb["values"] = sorted(self.by_lang)
+                self._refresh_langs(select_first=False)
                 want = self.settings.get("voice", core.DEFAULT_VOICE)
                 cur = next((v for v in cat if v.key == want), None) or (cat[0] if cat else None)
                 if cur:
                     self.lang_var.set(cur.language)
                     self._on_lang(select_key=cur.key)
             self.run_bg(work, done)
+
+        def _visible_langs(self) -> list[str]:
+            langs = sorted(self.by_lang)
+            if self.all_langs_var.get():
+                return langs
+            english = [l for l in langs if any(v.key.startswith("en_") for v in self.by_lang[l])]
+            return english or langs
+
+        def _refresh_langs(self, select_first: bool = True):
+            langs = self._visible_langs()
+            self.lang_cb["values"] = langs
+            if select_first and self.lang_var.get() not in langs and langs:
+                self.lang_var.set(langs[0])
+                self._on_lang()
 
         def _on_lang(self, select_key: str | None = None):
             voices = self.by_lang.get(self.lang_var.get(), [])
@@ -375,8 +416,10 @@ def run_gui(smoke_log: str | None = None) -> int:
             if not v:
                 self.voice_status.set("")
                 return
-            if core.is_voice_installed(v.key):
-                self.voice_status.set(f"{v.key}  -  installed")
+            if core.is_voice_bundled(v.key):
+                self.voice_status.set(f"{v.key}  -  built in")
+            elif core.is_voice_installed(v.key):
+                self.voice_status.set(f"{v.key}  -  downloaded")
             else:
                 size = f" (~{v.size_bytes / 1e6:.0f} MB)" if v.size_bytes else ""
                 self.voice_status.set(f"{v.key}  -  will be downloaded on first use{size}")
@@ -659,7 +702,8 @@ def run_gui(smoke_log: str | None = None) -> int:
                 speed=round(float(self.speed_var.get()), 2),
                 speaker=self._speaker(),
                 output_dir=self.out_var.get(), cps_dir=self.cps_var.get(),
-                copy_after=bool(self.copy_after_var.get()))
+                copy_after=bool(self.copy_after_var.get()),
+                all_languages=bool(self.all_langs_var.get()))
             core.save_settings(self.settings)
 
         def _on_close(self):
@@ -711,7 +755,10 @@ def main() -> int:
     ap.add_argument("--log", help="write a log file")
     ap.add_argument("--selftest", metavar="DIR", help="generate the sample phrases into DIR and verify them")
     ap.add_argument("--gui-smoketest", metavar="LOGFILE", help=argparse.SUPPRESS)
+    ap.add_argument("--check-voices", metavar="LOGFILE", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.check_voices:
+        return check_bundled_voices(args.check_voices)
     if args.gui_smoketest:
         return run_gui(smoke_log=args.gui_smoketest)
     if args.selftest or args.generate:
