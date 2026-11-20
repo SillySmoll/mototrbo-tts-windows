@@ -1,5 +1,7 @@
-name: Build Windows app
+name: Build Windows installer
 
+# Builds MotoTRBO-TTS-Setup with every English Piper voice built in, tests it,
+# and publishes it as a GitHub Release (the installer is several GB, split into parts).
 on:
   push:
     branches: [main, master]
@@ -7,11 +9,19 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # to create the Release
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      VOICE_MATCH: "^en_"     # which voices to bundle (regex on voice key)
+      VOICE_MATCH_ID: "english" # change this whenever VOICE_MATCH changes
     steps:
       - uses: actions/checkout@v4
 
@@ -24,36 +34,83 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
-      - name: Build MotoTRBO-TTS.exe
+      - name: Build app folder (PyInstaller)
         run: >
-          pyinstaller --noconfirm --clean --onefile --windowed
+          pyinstaller --noconfirm --clean --onedir --windowed
           --name MotoTRBO-TTS --icon icon.ico --add-data "icon.ico;."
           --collect-all piper --collect-binaries onnxruntime
           app.py
 
-      - name: Self-test the exe
+      - name: Restore voice cache
+        uses: actions/cache@v4
+        with:
+          path: voices
+          key: piper-voices-${{ hashFiles('fetch_voices.py') }}-${{ env.VOICE_MATCH_ID }}
+
+      - name: Download English voices
+        run: python fetch_voices.py --match "${{ env.VOICE_MATCH }}" --out voices
+
+      - name: Test - generate announcements
         shell: pwsh
+        env:
+          MOTOTRBO_BUNDLED_VOICES: ${{ github.workspace }}\voices
         run: |
           $out = Join-Path $env:RUNNER_TEMP "selftest"
-          $p = Start-Process -FilePath dist\MotoTRBO-TTS.exe -ArgumentList "--selftest", "`"$out`"" -Wait -PassThru
+          $p = Start-Process dist\MotoTRBO-TTS\MotoTRBO-TTS.exe -ArgumentList "--selftest", "`"$out`"" -Wait -PassThru
           Get-Content "$out\selftest.log"
           if ($p.ExitCode -ne 0) { throw "Self-test failed" }
 
-      - name: GUI smoke test
+      - name: Test - every built-in voice speaks
+        shell: pwsh
+        env:
+          MOTOTRBO_BUNDLED_VOICES: ${{ github.workspace }}\voices
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "voices.log"
+          $p = Start-Process dist\MotoTRBO-TTS\MotoTRBO-TTS.exe -ArgumentList "--check-voices", "`"$log`"" -Wait -PassThru
+          Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "Voice check failed" }
+
+      - name: Test - window opens
         shell: pwsh
         run: |
           $log = Join-Path $env:RUNNER_TEMP "gui.log"
-          $p = Start-Process -FilePath dist\MotoTRBO-TTS.exe -ArgumentList "--gui-smoketest", "`"$log`"" -Wait -PassThru
+          $p = Start-Process dist\MotoTRBO-TTS\MotoTRBO-TTS.exe -ArgumentList "--gui-smoketest", "`"$log`"" -Wait -PassThru
           Get-Content $log
           if ($p.ExitCode -ne 0) { throw "GUI smoke test failed" }
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: MotoTRBO-TTS-windows
-          path: dist/MotoTRBO-TTS.exe
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc /Q installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          Get-ChildItem installer-output | Format-Table Name, @{n="MB";e={[math]::Round($_.Length/1MB)}}
 
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Test - install silently and run from the installed copy
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "installed"
+          $p = Start-Process installer-output\MotoTRBO-TTS-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Installer failed ($($p.ExitCode))" }
+          $n = (Get-ChildItem "$dir\voices\*.onnx").Count
+          Write-Host "Installed voices: $n"
+          if ($n -lt 1) { throw "No voices were installed" }
+          $out = Join-Path $env:RUNNER_TEMP "installed-selftest"
+          $p = Start-Process "$dir\MotoTRBO-TTS.exe" -ArgumentList "--selftest", "`"$out`"" -Wait -PassThru
+          Get-Content "$out\selftest.log"
+          if ($p.ExitCode -ne 0) { throw "Installed app self-test failed" }
+
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/MotoTRBO-TTS.exe
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
+          name: MotoTRBO TTS ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build {0}', github.run_number) }}
+          body: |
+            Windows installer with all English Piper voices built in.
+
+            **Download every file below into the same folder**, then run `MotoTRBO-TTS-Setup.exe`.
+            The `.bin` files are parts of the installer and must sit next to the `.exe`.
+          files: installer-output/*
